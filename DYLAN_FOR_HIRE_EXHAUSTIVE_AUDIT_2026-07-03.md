@@ -1,0 +1,160 @@
+# DYLAN FOR HIRE — EXHAUSTIVE PRODUCT AUDIT & RECAP
+### Compiled 2026-07-03 · line-by-line review of every doc + targeted code/log verification
+### Supersedes: `DYLAN_RECAP_2026-07-03.md` and `DYLAN_MASTER_RECAP_2026-07-03.md` (both same-day, shallower passes)
+
+---
+
+## 0. WHAT THIS PASS ACTUALLY COVERED (read this before trusting anything below)
+
+Per your instruction to go through "every single line, document and idea," here is the honest scope of this pass, not a rounded-up claim:
+
+**Read in full:** every file in the project's canonical numbered doc set (`00_INDEX.md` through `12_SCHEDULING_SETUP_GUIDE.md`), `SAAS_PROJECT_HEALTHCARE_RECRUITMENT_MASTER_CONTEXT.md`, the entire `DYLAN_AUDIT_2026-07-01_FULL.md` audit trail (1,106 lines, Rounds 1–13 plus a 2026-07-03 scheduled drift check), all five `BLUELINE_*.md` docs, BlueLine's own `CLAUDE.md`, both `Dylan_for_Hire_BlueLine_*.md` files, and this project's `git log` in full.
+
+**Verified directly against code/logs, not just read as claims:** current version headers in `master_daily_agent.py`, whether `master_candidate_file_consolidator.py` actually exists on the BlueLine deployment (it doesn't), test counts in both the BlueLine and project copies of `tests/test_pipeline_logic.py` (16 vs. ~79 `def test_` blocks — a real, current gap, see §5), `blueline_intake.py`'s actual purpose (previously an open question in BlueLine's own docs — resolved below), file timestamps on `gmail_credentials.json` / `gmail_credentials_NEW.json` / `gmail_token.json`, and the live tail of `cron_output.log` from earlier today.
+
+**Sampled, not exhaustively read:** of 109 total local Cowork sessions, every uniquely-titled Dylan/BlueLine-relevant one was read in full ("Resume screening and intro message," "Project documentation audit," "Dylan for Hire documentation update," "Dylan for Hire SaaS project," plus the ones behind this project's earlier recaps). The ~70 "Blueline live monitor"/"...continuation" runs and ~12 "Dylan/BlueLine audit sync daily" runs were **not** individually read — they are a recurring scheduled task whose output is already the audit trail and doc set you're reading here; reading each instance would reread the same conclusions repeatedly. WV/Peak Protocol/other-project sessions were excluded as out of scope.
+
+**Not done, and not possible from here:** anything requiring your actual Mac (confirming `launchctl list`, real crontab state beyond what's quoted in docs, whether the two 24/7 services are actually running). Every doc that claims this is unconfirmed says so explicitly — I have not overridden any of those flags with a guess.
+
+---
+
+## 1. WHERE EVERY DOCUMENT ACTUALLY LIVES (and which copies are stale)
+
+This project has accumulated **three physical locations** holding overlapping doc/code sets, only one of which is current:
+
+| Location | What's there | Status |
+|---|---|---|
+| **This project's root** (`~/Claude/Projects/Dylan for Hire.../`) | `00_INDEX.md` through `12_SCHEDULING_SETUP_GUIDE.md`, `SAAS_PROJECT_HEALTHCARE_RECRUITMENT_MASTER_CONTEXT.md`, `DYLAN_AUDIT_2026-07-01_FULL.md`, `src/` (9 `.py` files), `tests/` (2 files, ~79 test functions), `pitch/`, `scripts/sync_check.sh` | **Current — this is the actual canonical set, v3.2/Round 14, updated as recently as today** |
+| `~/Downloads/BlueLine/` | The **live production deployment** — same 7 pipeline `.py` files (byte-identical to `src/`, confirmed via `diff -q`), plus its own 5 `BLUELINE_*.md` docs, `CLAUDE.md`, and — separately — a **stale copy** of an older `00_INDEX.md`...`08_TROUBLESHOOTING.md` set (106-line `00_INDEX.md` vs. this project's 474-line current version) | Code is current (synced); the numbered-doc copy sitting alongside it is an old snapshot, not touched since before this project's doc set grew past `08` |
+| `~/Downloads/DylanForHire/` | An **entirely separate, older, stale copy** — `00_INDEX.md`...`08_TROUBLESHOOTING.md` (identical to BlueLine's stale copy), plus `src/` code that is **materially behind**: `master_daily_agent.py` is 27,403 bytes / dated Jun 30 here vs. 58,192 bytes / current in the real locations — missing the entire v2.4 reconciliation through v2.6 Round 11–14 history | **Stale. My prior same-day recap wrongly recommended making this folder canonical — that was wrong; see correction below.** |
+
+**Correction to my own earlier work today:** the first two recap docs I produced earlier in this session (`DYLAN_RECAP_2026-07-03.md`, `DYLAN_MASTER_RECAP_2026-07-03.md`) recommended making `~/Downloads/DylanForHire/` canonical over what I called "`Dylan_for_Hire_Master_Context.md`." Neither of those things is right: `~/Downloads/DylanForHire/` is a stale June 30 snapshot, and the actual canonical file is `SAAS_PROJECT_HEALTHCARE_RECRUITMENT_MASTER_CONTEXT.md` sitting in **this project's own root**, which is already current (last touched 2026-07-01, cross-referenced by the numbered docs, and itself the highest-priority doc per `00_INDEX.md`'s own document map). There is no real "two doc sets to reconcile" problem inside this project — that was resolved before this session even started, likely in the "Dylan for hire project migration" and "Dylan for Hire documentation update" sessions. The actual clutter is the two **external, stale** copies (`~/Downloads/BlueLine/00_INDEX.md`...`08` and all of `~/Downloads/DylanForHire/`), which nothing currently reads from and which should probably just be deleted or clearly marked dead, since a future session skimming `~/Downloads/` could easily mistake one of them for current.
+
+**Meta-finding worth flagging:** the "project custom instructions" text that gets loaded into every Cowork session automatically for this project (visible at the top of my context every time) is itself an **old snapshot** — it matches the content of `Dylan_for_Hire_BlueLine_Technical_Reference.md` plus an old Calendly guide from before the Round 13 restructuring that split BlueLine-specific detail out of the master context doc and rewrote it around Rule 0 through 0E. It does not reflect the current `SAAS_PROJECT_HEALTHCARE_RECRUITMENT_MASTER_CONTEXT.md` at all — no Rule 0, no numbered-doc structure, no v2.6 architecture, none of it. This isn't something I can fix from inside a conversation (it's a Cowork project-settings snapshot, not a file), but it means **every new session automatically starts from an outdated brief** unless it also reads the real files. Worth raising with whoever owns the Cowork project settings for this workspace.
+
+---
+
+## 2. THE FULL AUDIT TRAIL, ROUND BY ROUND (from `DYLAN_AUDIT_2026-07-01_FULL.md`, 1,106 lines)
+
+This file is the project's own append-only audit log, mandated by Rule 0B in `00_INDEX.md`. It is genuinely thorough — reading it in full is close to reading a running commit log with reasoning attached. Summary, in order:
+
+- **Round 1:** cross-doc consistency pass — found the doc set had drifted from code (stale bug claims, wrong function names referenced in new v2.0 files).
+- **Round 2:** line-by-line `.py` read (not just doc cross-checking) — found the "11-point" credential claim was actually 9 categories in code; found `build_pitch_deck.py`/`build_arch_doc_v2.py` write to the wrong filenames entirely.
+- **Round 3:** two uploaded files (`Dylan_for_Hire_Scheduling_Setup_Guide.md`, `Dylan_for_Hire_Product_Overview.md`) reconciled against source — the uploaded Product Overview repeated the already-debunked "11-point" claim AND had its own new errors (omitted resume/COVID, wrongly included Hep B/flu/background-check as if implemented). Corrected and saved as `11_CUSTOMER_FACING_PRODUCT_OVERVIEW.md`.
+- **Round 4:** your explicit product decision — add Hepatitis B + annual flu vaccine to the automated check as **recommended, not mandatory** (same non-blocking pattern as BLS/CPR), because both accept a signed declination as compliant. NYS background-check/fingerprint deliberately left undecided (different risk profile, no declination alternative).
+- **Round 5:** built the client-intake questionnaire + adapter spec (`10_CLIENT_INTAKE_AND_ADAPTER_SPEC.md`); confirmed directly in code that the system is **not yet platform-agnostic** — no adapter layer exists, it's BlueLine's hardcoded integrations end to end.
+- **Round 6:** first round with **actual persisted pytest evidence** (69 tests). Found and fixed BUG-19 (name-matching logic bug — `lastName` never holds a surname, it holds a license code) and BUG-20 (Quo contact fields read at the wrong JSON nesting level — independently broke every match even after BUG-19's fix). Built and logic-tested the email-opt-out-to-SMS-opt-out auto-sync. Added Rule 0C (persist tests in `tests/`, never a scratch dir) after discovering an earlier session's test claim was never actually saved anywhere.
+- **Round 7:** connected `~/Downloads` for the first time and immediately found the deployed `master_daily_agent.py` (v2.3, real cron script) had **silently diverged** from `src/` (v2.2) — each had real fixes the other lacked, and the live production script was missing TCPA STOP-language coverage the whole time. Reconciled to v2.4, then — per your explicit instruction ("ensure maximum compliance, no duplication of messages, opt-out should be ironclad") — hardened to v2.5 with a process lock, a hard opt-out re-check inside `send_sms()`, and a fix for candidates silently vanishing on send failure. **Deployed live**, verified byte-identical by diff. Added Rule 0E (`src/` is not automatically the same as deployed — always diff before claiming reconciliation).
+- **Round 8/9:** live-testing the 24/7 Pub/Sub listener surfaced a real crontab misconfiguration (wrong `TZ` variable name, running hourly instead of daily — later found to have caused ~163 extra intro SMS over 59 days, not catastrophic but real), then found the **deployed `master_gmail_reviewer.py` was the original May 4 version** (725 lines, no version header) while `src/` was v1.2 (1,175 lines) — none of the v3.0 email/pipeline-stage work had ever reached the live Mac. Deployed it, found and fixed a double-base64-decode bug in the Pub/Sub listener, and verified the full chain live against a real test email.
+- **Round 9B/9C:** found the Quo contact-lookup step was taking **4m51s per email** (fetching all ~3,794 contacts from scratch every time) — added a 5-minute TTL cache, verified live drop to 16ms on warm-cache hits. Found and fixed a second bug in the same area: contact-ID resolution after a name match only searched the first 100 of ~3,794 contacts.
+- **Round 10:** found none of the 6 Quo HTTP call sites in `master_daily_agent.py` set a request timeout — a single stalled connection could freeze the entire 24/7 SMS poll loop forever, silently. Fixed with a 20s timeout + a structural AST-based test that will catch any future call site missing one, not just today's six.
+- **Round 11:** you gave three explicit rules in one message ("replying instantly is mandatory," "unlimited new-lead texting based on input volume," 72-hour nudge window) — this surfaced a real bug: the old "30/day" cap math computed `days_missed = 0` for same-day reruns, so a faster cron cadence would have silently re-granted a fresh 30-lead budget on every run (worst case ~500/day). Fixed by removing Step 3 from the cron entirely (now poll-service-exclusive, closing a duplicate-response race) and removing the daily cap (gated by real dedup instead).
+- **Round 12:** two more explicit rules — no duplicate sends, ever, plus a genuine rolling 75/day safety cap. Added SHA-256 message fingerprinting with a 24h cooldown, and a real rolling-24h-window cap (not calendar-day) with an automatic-resume notification instead of a hard stop.
+- **Round 13:** a real incident — two concurrent Claude sessions (this Cowork project and a separate Claude Code session) both editing `~/Downloads/BlueLine/` with no visibility into each other, producing a confusing tool-result note that looked like it might be prompt injection but was confirmed (by you) to just be the other session's own comment. Git was initialized in both folders as the fix (not real-time cross-session awareness, which isn't buildable from here) — this surfaced **real drift on 6 of 8 shared files**, reconciled file-by-file, plus two real test-isolation bugs found by running the suite twice in a row.
+- **2026-07-03 scheduled check:** `scripts/sync_check.sh` run — no drift found, all 6 auto-synced files byte-identical. One unrelated item flagged: `~/Downloads/BlueLine/CLAUDE.md` shows as modified/uncommitted in git — not part of this run's scope, needs a commit or revert from whoever touched it.
+
+**Gap found in this pass, not previously logged:** git commit messages in both repos reference **"Round 14"** ("doc-consistency pass — found and fixed 6 real doc-vs-code mismatches," "code-correctness pass — pyflakes clean, 138/138 tests") dated 2026-07-02 23:38–23:44. `DYLAN_AUDIT_2026-07-01_FULL.md` has **no Round 14 section** — the file jumps from Round 13 straight to the 2026-07-03 scheduled check. This is exactly the failure mode Rule 0B exists to prevent (real work happened and was committed, but the mandatory audit-trail append didn't happen for it). I recovered what Round 14 actually did from the "Project documentation audit" session transcript directly (see §5) so it isn't lost, but the audit file itself should get a Round 14 entry appended — I'm flagging rather than writing it myself, since Rule 0B's whole point is that the session doing the work logs it in the same session, and backfilling it now from a transcript read is a reasonable one-time exception, not the standing process.
+
+---
+
+## 3. THE PRODUCT, CURRENT AND ACCURATE AS OF TODAY
+
+**What it is:** Dylan for Hire — an AI recruiting agent for healthcare staffing agencies, proven on BlueLine Staffing (the live proof of concept), sold to other small US nurse staffing agencies (2–50 employees).
+
+**Pricing (locked):** $497 DIY one-time · **$1,500 setup + $750/month Pro Retainer (primary)** · Enterprise custom quote.
+
+**Revenue path (anchor milestone):** Month 1 (2 clients, $3K setup) → Month 2 ($3K/mo MRR) → Month 3 ($4.5K/mo, referrals) → **Month 4+: 7 clients, $5.3K/mo MRR.**
+
+**What it actually does today (v3.x, verified against `src/` and the deployed copy, not just the pitch deck):**
+1. Candidate applies (CSV/Indeed/email/web).
+2. Intake captured automatically.
+3. **Inbound SMS handled continuously** by `master_sms_poll_service.py` (90-second poll, 24/7) — this is now the *exclusive* handler for SMS replies; the daily cron no longer touches this at all (changed Round 11).
+4. **Inbound email handled continuously** by `master_gmail_pubsub_listener.py` (Gmail push via Google Cloud Pub/Sub pull subscription) — covers both document submissions and general inquiries, checking Gmail + Quo history before drafting/skipping/flagging.
+5. Documents audited: **8 required + 3 recommended = 11 tracked categories** (never say "11-point" without this split — see §2 Round 2–4). Zero human review of the audit step itself; human reviews the draft reply before sending.
+6. Shift matched by borough/role.
+7. Client alerted (in this context, "client" = the candidate/facility loop closing) within minutes.
+8. Daily 9am cron now runs **Step 1 (re-engage, 72h window) → DEDUP → Step 2 (new-lead intro, unlimited per run, gated by a rolling 75/day safety cap with duplicate-send fingerprinting) only.**
+
+**Only manual step: the sales call, plus reviewing/sending anything Dylan drafts or flags.** This is a deliberate, permanent product feature (see `2A. HONEST POSITIONING` in the master context doc) — sell it as "always watching, always ready, never sends anything sensitive without you," not as fully autonomous.
+
+**Proven results (BlueLine, business-reported, re-verify before every customer call — do not reuse a stale snapshot):** 37 active nurses (22 CNA/9 LPN/6 RN), 19 FT/16 PT/2 per diem, $30–35K monthly payroll, $42–48K monthly client billing, 83% intake time reduction, sub-4-minute candidate-to-alert time, one operator running what needed three.
+
+---
+
+## 4. EVERY OPEN GAP, RANKED BY WHAT ACTUALLY MATTERS
+
+### 🔴 Highest priority — operationally unconfirmed, could mean candidates are getting no reply right now
+**Are `master_sms_poll_service.py` and `master_gmail_pubsub_listener.py` actually running as background/launchd processes on your Mac?** This exact question is flagged, independently, in `09_GO_LIVE_READINESS.md`, `BLUELINE_MASTER_OPS.md`, and `BLUELINE_TECH_CONFIG.md` — three separate documents converge on the same unresolved item. Step 3 (SMS replies) was deliberately removed from the 9am cron on the assumption the poll service covers it 24/7 (Round 11). **If it isn't actually running, Step 3 currently has no active handler of any kind.** This cannot be checked from any Cowork or Claude Code session — it requires `launchctl list | grep blueline` run directly on your Mac. Nothing else on this list matters if this is unconfirmed.
+
+### 🔴 A real, currently-live bug found in today's own cron log (not previously documented anywhere)
+Reading the tail of `~/Downloads/BlueLine/cron_output.log` from earlier today surfaced something none of the audit rounds caught: the Gmail document reviewer is processing **known BlueLine center/facility contacts** (`dp@fvrehab.com` — Debbie Umrao-Paray, Forest View/Cliffside/Woodcrest per `BLUELINE_CENTER_DIRECTORY.md`; `mmeyer@dbnrc.com` — Downtown Brooklyn Nursing; `mhaynes@bgrehabcare.com` — Beach Gardens; `nsathi@theriversiderehab.com` — Riverside Rehabilitation) as if they were **candidates**, producing nonsense output like `DOC DRAFT SAVED ... (license: None)` and attempted `PIPELINE:DOCS_INCOMPLETE` stage pushes for people who run nursing homes, not people applying for nursing jobs. The system correctly failed to push the bogus stage tag each time (no confident Quo contact match, since these are center contacts with no Quo record) — so no visible harm reached the dashboard — but it's still generating wasted Claude Vision calls, wasted doc-review drafts, and log noise on every real center email. The underlying cause looks like the same gap `is_system_or_non_candidate_email()` was built to prevent (it already excludes BlueLine's own address) — it just doesn't yet exclude known center-domain senders. Worth a fix: either extend that exclusion list with the center directory's domains, or add a cheaper pre-check ("does this sender's domain match a known center") before spending a Vision call on it.
+
+### 🔴 Also surfaced in the same log: a real Claude Vision failure
+A document from `mmeyer@dbnrc.com` failed analysis with `400 Bad Request: messages.0.content.1.image.source.base64: The image was specified using the image/png media type, but the image appears to be a image/jpeg image` — the code is trusting the attachment's declared MIME type rather than sniffing actual file bytes, and Claude's API correctly rejects the mismatch. This is a real, silent failure mode: a genuine candidate document could fail analysis the same way and get dropped with no visible signal beyond a log line reading "Claude returned no analysis." Worth a targeted fix (sniff magic bytes, or catch this specific 400 and retry with the corrected media type) rather than leaving it as a silent per-attachment loss.
+
+### 🟡 A verification-suite gap that undercuts every "N/N tests passing" claim from Round 7 onward
+`~/Downloads/BlueLine/tests/test_pipeline_logic.py` has **16** `def test_` functions. This project's `src/tests/test_pipeline_logic.py` has **~79** (collected pytest count is higher still — the audit trail's own numbers go 69→75→100→112→118→120→124→130→135→138 across Rounds 6–14). Those two numbers should be the same file, byte-for-byte, per the exact same "8 pipeline files stay in sync" rule `scripts/sync_check.sh` already enforces — but the test suite isn't one of the files that script tracks. **Practical implication: if anyone runs `pytest` directly inside `~/Downloads/BlueLine/tests/` (which is what several of the docs' own commands literally say to do — `cd tests && python3 -m pytest -v`), they get the old ~16-test suite, not the 138-test suite that's actually been validating Rounds 6–14's fixes.** The "proven" claims in `09_GO_LIVE_READINESS.md`'s verification log are true of the project's `src/tests/` copy; they have not been re-confirmed against whatever test file is sitting next to the actual deployed code. Recommend adding `tests/test_pipeline_logic.py` and `tests/conftest.py` to `sync_check.sh`'s tracked-file list.
+
+### 🟡 `master_candidate_file_consolidator.py` (STEP 7 — candidate file consolidation, center-submission drafting) does not exist on the live BlueLine deployment
+It exists only in this project's `src/` folder. `04_DAILY_OPERATIONS.md` Part 3C instructs you to run `cd ~/Downloads/BlueLine && python3.11 master_candidate_file_consolidator.py --email candidate@example.com` when a candidate shows Submission-Ready on the dashboard — that command will fail with a file-not-found error today, because the file was never deployed (it's also not tracked by `sync_check.sh`). This is a smaller version of the exact Round 7/9 "src/ isn't automatically deployed" pattern, just not yet caught because the feature is new (built 2026-07-02) and, per `05_PIPELINE_REFERENCE.md`'s own note, "NOT YET RUN against real data" regardless of deployment.
+
+### 🟡 `blueline_intake.py`'s purpose — previously an open question, now resolved by direct read
+`BLUELINE_TECH_CONFIG.md` flags this file's role as "[VERIFY: purpose still unconfirmed]." Reading it directly: it's a standalone CSV intake cleaner meant to be run manually *before* `master_daily_agent.py` each day — it takes a dropped-in `new_leads.csv`, validates/normalizes it (phone, name, role against a `VALID_ROLES` set including some roles like `MA`/`CMA` not otherwise documented anywhere else in this project), and appends clean rows onto `CONFIDENTIAL_candidates.csv`. It is not called by any other script and isn't part of the automated pipeline — it's a manual pre-processing utility. Worth adding one line to `BLUELINE_TECH_CONFIG.md`/`02_SYSTEM_ARCHITECTURE.md` to close this flag out rather than leaving it open indefinitely.
+
+### 🟡 Unclear which Gmail OAuth credential file is actually live
+`~/Downloads/BlueLine/gmail_credentials.json` (414 bytes, May 8) sits alongside `gmail_credentials_NEW.json` (453 bytes, **July 2** — the same day the dedicated `dylan-for-hire` GCP project was created per `09_GO_LIVE_READINESS.md` item 2). `gmail_token.json` is still dated May 8, meaning whatever's authenticating right now was generated under the old credentials, not the new GCP project. This is exactly the kind of thing Round 9 already found once (wrong-GCP-project Gmail credentials contributing to that round's saga) — worth a direct check on your Mac of which file `master_gmail_reviewer.py` is actually loading and whether `gmail_credentials_NEW.json` is meant to replace it or is leftover from an in-progress migration nobody finished.
+
+### 🟡 Live-Mac verification still outstanding (unchanged from `09_GO_LIVE_READINESS.md`'s own list — not resolved by this pass, since none of it is checkable from here)
+Real opt-out email → SMS opt-out sync end-to-end test; Hep B/flu-vaccine field extraction against a real submitted document (do **not** update `11_CUSTOMER_FACING_PRODUCT_OVERVIEW.md` until this passes); 48+ hour stability run of both 24/7 services; real Claude API cost measurement under continuous load (placeholder estimate ~$135–145/mo total tool stack is unconfirmed).
+
+### 🟢 Genuinely closed, verified, not just claimed
+The Quo API URL/Bearer bug (fixed 2026-06-29, re-confirmed multiple audit rounds). BUG-14 (Gmail token path). BUG-15 (SMS poll service calling a nonexistent function — would have crashed the entire 24/7 SMS feature on first launch). BUG-16 (missing STOP language). BUG-17 (narrower opt-out/interest keywords than documented). BUG-18 (emoji in SMS). BUG-19/20 (name-matching + schema-nesting bugs in `email_context_bridge.py`). The pitch-deck build-script mismatch (redirected to a deprecated path rather than silently regressing the real, audio-embedded decks). The 4m51s→16ms Quo-contact-cache fix. The unbounded-timeout fix across all 6 Quo HTTP call sites. The duplicate-send fingerprinting and rolling 75/day cap. Git version control now exists in both `~/Downloads/BlueLine/` and this project, closing the "two concurrent sessions silently clobber each other" risk that caused Round 13's incident.
+
+### 🔴 Security — carried over, still not actioned
+A real ElevenLabs API key was committed in plaintext to `02_SYSTEM_ARCHITECTURE.md` at the baseline commit (`3e936f5`). The working file is redacted, but the key is still recoverable from git history. **Neither rotating the key nor rewriting history has been done.** This has now been flagged in at least three separate sessions/documents — it needs an actual decision, not another flag.
+
+### Product decision still open, not a bug
+`step1_reengage_stalled()` has no permanent-skip path — a non-responsive contact gets silently re-evaluated by Claude forever, on every run, with no cutoff. Three docs (including BlueLine's own `CLAUDE.md`) previously claimed a `NO_RESPONSE_FINAL` fallback exists for this; confirmed by direct grep across all of `src/` that it does not exist anywhere in the current codebase (this was corrected in the Round 14 doc-consistency pass). Your call: add a real last-resort message and/or permanent-skip list, or is silent-forever acceptable given the low practical cost of re-evaluating a stalled contact once every ~3 days?
+
+---
+
+## 5. WHAT "ROUND 14" ACTUALLY DID (recovered from session transcript, since the audit file itself has no entry)
+
+From the "Project documentation audit" session (today, before this one): removed 6 confirmed-dead imports/lines across `master_daily_agent.py`, `master_gmail_reviewer.py`, `master_gmail_pubsub_listener.py`, and `master_candidate_file_consolidator.py` (each verified dead via `pyflakes` plus a manual call-site trace — not assumed). `pyflakes` is now clean across all of `src/` and the live BlueLine deployment. Full test suite: 138/138, run twice consecutively. Fixed 6 real doc-vs-code mismatches: stale 96h→72h references remaining in 3 docs, a stale 30/day cap reference, a wrong model name in `CLAUDE.md` (said `claude-opus-4-5` where the real re-engagement model is `claude-haiku-4-5-20251001`), and the `NO_RESPONSE_FINAL`/`never_replied` fiction (see above). All fixes synced back to the live BlueLine folder and re-verified in sync via `diff -q`. Both git repos committed and `fsck`'d clean.
+
+That same session ended by explicitly flagging the two items still needing your decision — the ElevenLabs key and the permanent-skip question — both still open as of this pass.
+
+---
+
+## 6. SALES & GO-TO-MARKET ASSETS — STATUS
+
+- **Pitch deck** (`pitch/dylan_for_hire_pitch_deck.html`, audio-embedded, ~11MB) and **architecture doc** (`pitch/dylan_for_hire_architecture.html`, ~6MB) are the real, current, presented assets. Their build scripts (`build_pitch_deck.py`, `build_arch_doc_v2.py`) do **not** regenerate these files — they write to a deliberately-deprecated path instead (fixed this way in Round 6 specifically to avoid silently regressing the real decks, since the scripts' own hardcoded content predates the 24/7 layer and has no embedded audio). To refresh either deck: hand-edit the real HTML directly.
+- Master context doc §9 flags that the "How Dylan Works"/"Features" slides in the separate `.pptx` deck (`Dylan_for_Hire_Pitch_Deck_V8_FINAL.pptx`, referenced but not confirmed present in this project folder) should be updated to describe continuous checking, not once-daily — this is now a stronger, accurate claim and hasn't been updated yet.
+- **11_CUSTOMER_FACING_PRODUCT_OVERVIEW.md** is the correct, sanitized, prospect-safe doc — it deliberately omits the 24/7 claim (not yet live-verified) and live metrics (would go stale). It correctly states the credential audit as 9 required categories per its own last full correction pass; note this predates the Round 4 Hep B/flu decision and should get one more pass to reflect "8 required + 3 recommended" once the Hep B/flu fields are live-tested against a real document — do not do this before that test passes.
+- **12_SCHEDULING_SETUP_GUIDE.md** is the current, correct, client-agnostic Calendly setup process; live account values live only in the master context doc §8, by design (single source of truth for values that change).
+- Outstanding, not yet done, entirely on you: record/update the Loom walkthrough to show real-time behavior, complete Stripe verification (non-US account processing delay), point `book.dylanforhire.com` at the Calendly URL, build the Carrd site, re-verify every Proof-slide number before the next live demo.
+
+---
+
+## 7. WHAT STILL NEEDS BUILDING (product-architecture level, not bug fixes)
+
+Per `10_CLIENT_INTAKE_AND_ADAPTER_SPEC.md`: the product is **not yet system-agnostic**, confirmed directly against `src/` — there is no `MessagingAdapter`/`EmailAdapter`/`LeadSourceAdapter`/`CredentialRuleset` interface of any kind. Every integration (OpenPhone-specific auth/pagination, Gmail-OAuth-specific scopes, CSV columns named exactly `Role`/`Location`, NY-specific credential rules) is hardcoded. A client on Twilio, Outlook, or outside NY cannot be onboarded today without real engineering work — the honest sales framing (already adopted in the spec) is to make OpenPhone + Gmail/Google Workspace a stated requirement, with anything else routed to a custom Enterprise quote rather than presented as an equally-supported option. The spec's own recommended build order — adapter interfaces first, then concrete OpenPhone/Gmail/CSV/NY implementations refactored (not rewritten) out of BlueLine's proven code, then a client-config schema with BlueLine as the first populated config, then re-running BlueLine's own verification suite against the refactor — has not been started.
+
+---
+
+## 8. THE ONE STRUCTURAL DEPENDENCY ON BLUELINE
+
+Every proof number in the Dylan pitch deck (37 nurses, payroll, billing, response times) is BlueLine's real, live data — there is no synthetic or aggregate "product" number anywhere. If BlueLine's real numbers change materially, the deck needs a refresh; whoever owns `scripts/sync_check.sh` going forward should also periodically sanity-check that the Proof slide hasn't gone stale, since — per Round 7/9's own history — silent drift between "documented" and "actually true" is this project's single most repeated failure pattern.
+
+---
+
+## 9. RECOMMENDED IMMEDIATE ACTIONS, IN ORDER
+
+1. **Confirm on your Mac** whether both 24/7 services are actually running (`launchctl list | grep blueline`). Everything else is secondary to this.
+2. Fix the center-contact-processed-as-candidate bug and the image-MIME-type Vision failure (§4) — both are live, both are generating real noise/waste right now, neither is hard to fix.
+3. Sync `tests/test_pipeline_logic.py` + `tests/conftest.py` from this project's `src/` to `~/Downloads/BlueLine/tests/` and add both to `sync_check.sh`'s tracked list, so "138/138 passing" is true of the file actually sitting next to the deployed code.
+4. Deploy `master_candidate_file_consolidator.py` to `~/Downloads/BlueLine/` if you intend to use the Submission-Ready dashboard workflow — right now the documented command will fail.
+5. Rotate the ElevenLabs API key (simplest fix; a git-history rewrite is the alternative but more disruptive).
+6. Decide the permanent-skip / `NO_RESPONSE_FINAL` question for stalled contacts.
+7. Delete or clearly mark dead the two stale external doc/code copies (`~/Downloads/DylanForHire/` entirely; the `00_INDEX.md`...`08_TROUBLESHOOTING.md` set sitting in `~/Downloads/BlueLine/` alongside the current `BLUELINE_*.md` docs) so a future session doesn't mistake either for current.
+8. Append the recovered Round 14 write-up (§5 above) to `DYLAN_AUDIT_2026-07-01_FULL.md` so the audit trail is actually complete.

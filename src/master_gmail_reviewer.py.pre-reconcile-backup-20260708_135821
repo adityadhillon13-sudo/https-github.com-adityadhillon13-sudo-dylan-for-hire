@@ -1,0 +1,1335 @@
+"""
+BlueLine Staffing — Master Gmail Document Reviewer
+====================================================
+Version: 1.2 | 2026-07-02
+Change (v1.2): Adds pipeline STAGE tracking. Every time a doc-review draft
+is composed, this script now also computes a single stage tag (see
+compute_pipeline_stage() below) and pushes it to the candidate's Quo
+contact `role` field via PATCH /contacts/{id}. This is the ONLY place
+in the whole system that writes structured pipeline status anywhere a
+dashboard can read it live — previously "docs complete" / "onboarding
+sent" only ever existed as prose inside a Gmail draft, unreadable by
+any dashboard. See 05_PIPELINE_REFERENCE.md STEP 6 for the full stage
+list and 09_GO_LIVE_READINESS.md for verification status (WRITTEN, NOT
+YET RUN against real data as of 2026-07-02 — test on one real
+candidate before trusting the dashboard's hot/submission-ready counts).
+Also adds `employment_application` as its own tracked Vision category
+(previously any onboarding-form scan would have been silently ignored
+or misclassified as "resume") — required to ever detect that a
+candidate has returned their completed onboarding form.
+Change (v1.1): Widened scope from "unread + has attachment" to ALL unread
+candidate emails. Emails WITH document attachments still go through the
+existing Claude Vision doc-review flow below (unchanged). Emails WITHOUT
+attachments (general inquiries — "what are your rates", "did you get my
+documents", etc.) are now routed through email_context_bridge.py, which
+checks BOTH this sender's full Gmail history AND their Quo/SMS history
+before Claude decides to draft a reply, skip, or flag for human review.
+This closes the gap where SMS re-engagement already read cross-channel
+history (upgrade1_context_aware_messaging.py) but email replies did not.
+
+Monitors info@bluelinestaffing.com for ALL candidate emails.
+Evaluates document completeness and validity across ALL emails from each
+sender (cumulative document pool — a candidate may send docs across
+multiple emails).
+
+DRAFT MODE: All replies are saved as Gmail Drafts. Nothing is sent automatically.
+Review drafts at mail.google.com before sending. This has not changed and
+does not change with v1.1 — see 07_COMPLIANCE.md rule #3 (non-negotiable).
+
+Called from master_daily_agent.py — can also be run standalone:
+  python3.11 master_gmail_reviewer.py
+
+For near-real-time operation (checked continuously through the day rather
+than once via cron), see master_gmail_pubsub_listener.py — it calls
+process_new_message_by_id() below for each new message as Gmail reports it,
+instead of re-scanning the unread list on a timer.
+"""
+
+import os
+import base64
+import json
+import re
+import logging
+import requests
+from datetime import datetime, date
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+from pathlib import Path
+from dateutil.relativedelta import relativedelta
+
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+import anthropic
+from dotenv import load_dotenv
+
+load_dotenv(os.path.expanduser("~/Downloads/.env"))
+
+from email_context_bridge import (
+    get_context_aware_email_reply, extract_display_name,
+    resolve_candidate_contact, _quo_get_all_contacts,
+)
+# [CLEANED 2026-07-02, Round 14 audit] sync_email_optout_to_sms and
+# match_phone_by_sender_name were imported here but never called directly —
+# both are real, still-active features, just fully encapsulated inside
+# email_context_bridge.get_context_aware_email_reply() / resolve_candidate_contact()
+# now. Confirmed via pyflakes + a manual call-site trace before removing,
+# not assumed dead from the unused-import warning alone.
+
+log = logging.getLogger("master.gmail")
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+GMAIL_SCOPES            = ["https://www.googleapis.com/auth/gmail.modify"]
+TOKEN_PATH              = os.path.expanduser("~/Downloads/gmail_token.json")
+CREDENTIALS_PATH        = os.path.expanduser("~/Downloads/gmail_credentials.json")
+PROCESSED_EMAILS_PATH   = os.path.expanduser("~/Downloads/master_processed_email_ids.txt")
+# Deliberately a SEPARATE file from master_needs_human_review.txt (SMS flags).
+# Keeps the existing SMS-review workflow in 04_DAILY_OPERATIONS.md untouched
+# and avoids mixing two different entry formats in one file.
+EMAIL_NEEDS_HUMAN_REVIEW_PATH = os.path.expanduser("~/Downloads/master_needs_human_review_email.txt")
+BLUELINE_EMAIL          = "info@bluelinestaffing.com"
+DESKTOP_APPS_DIR        = os.path.expanduser("~/Desktop/aditya")
+
+# ── Quo (OpenPhone) — status push, same API this whole project already uses ────
+# Reuses the exact base URL / auth convention verified in master_daily_agent.py
+# and upgrade1_context_aware_messaging.py — no new API, no new credentials.
+QUO_API_KEY    = os.getenv("QUO_API_KEY")
+QUO_BASE_URL   = "https://api.openphone.com/v1"
+
+# Pipeline stage tags written to the Quo contact's `role` field (currently
+# unused/blank on every contact per the 2026-07-02 audit — safe to repurpose).
+# Chosen over a brand-new custom field because `role` is already exposed by
+# both the real OpenPhone API and every read tool (list-contacts/get-contact),
+# so a live dashboard can read it with zero new infrastructure.
+STAGE_NEW                   = "PIPELINE:NEW"
+STAGE_DOCS_INCOMPLETE       = "PIPELINE:DOCS_INCOMPLETE"
+# [FIXED 2026-07-02] These previously contained a literal "|" (e.g.
+# "DOCS_COMPLETE|ONBOARD_SENT"). Every tool that reads Quo contacts renders
+# them as pipe-delimited text (id | name | company | role | email | phone)
+# WITHOUT escaping pipes inside field values — so a role value containing
+# "|" silently shifted every column after it (role/email/phone) out of
+# alignment for that row. This broke the Pipeline Dashboard's parsing the
+# moment any real stage got pushed. Underscore-only tags below; never put
+# "|" inside a value that flows through this API again.
+STAGE_DOCS_COMPLETE_SENT    = "PIPELINE:DOCS_COMPLETE_ONBOARD_SENT"      # "hot file"
+STAGE_READY_FOR_SUBMISSION  = "PIPELINE:ONBOARD_RETURNED_READY_FOR_SUBMISSION"
+STAGE_SUBMITTED_PREFIX      = "PIPELINE:SUBMITTED:"                      # + ISO date
+
+APP_RN  = "Editable Onboarding Blueline RN .pdf"
+APP_LPN = "Editable Onboarding Blueline LPN .pdf"
+APP_CNA = "Editable Onboarding Blueline CNA .pdf"
+
+TODAY = date.today()
+
+# ── Document validity windows ───────────────────────────────────────────────────
+MAX_PHYSICAL_MONTHS  = 12
+MAX_TITER_YEARS      = 5
+MAX_CHEST_PPD_MONTHS = 9
+
+# ── I9 Lists ───────────────────────────────────────────────────────────────────
+I9_LIST_A = [
+    "u.s. passport", "u.s. passport card", "permanent resident card",
+    "alien registration receipt card", "form i-551", "foreign passport with i-551",
+    "employment authorization document", "form i-766", "foreign passport with form i-94",
+    "passport from federated states of micronesia",
+    "passport from republic of the marshall islands",
+]
+I9_LIST_B = [
+    "driver's license", "drivers license", "driver license", "state id card",
+    "state-issued id", "government id", "federal id", "school id",
+    "voter registration card", "voter's registration card", "u.s. military card",
+    "military id", "draft record", "military dependent id",
+    "coast guard merchant mariner card", "native american tribal document",
+    "canadian driver's license", "canadian drivers license",
+]
+I9_LIST_C = [
+    "social security card", "social security account number card",
+    "certification of report of birth", "form ds-1350", "form fs-545",
+    "form fs-240", "birth certificate", "native american tribal document",
+    "u.s. citizen id card", "form i-197",
+    "identification card for use of resident citizen", "form i-179",
+    "employment authorization document issued by department of homeland security",
+]
+SS_INVALID_RESTRICTIONS = [
+    "not valid for employment",
+    "valid for work only with ins authorization",
+    "valid for work only with dhs authorization",
+]
+
+
+# ── Auth helpers ───────────────────────────────────────────────────────────────
+
+def get_claude_client():
+    api_key = os.getenv("CLAUDE_API_KEY")
+    if not api_key:
+        raise ValueError("CLAUDE_API_KEY not set in ~/Downloads/.env")
+    return anthropic.Anthropic(api_key=api_key)
+
+
+def get_gmail_service():
+    creds = None
+    if os.path.exists(TOKEN_PATH):
+        creds = Credentials.from_authorized_user_file(TOKEN_PATH, GMAIL_SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            if not os.path.exists(CREDENTIALS_PATH):
+                raise FileNotFoundError(
+                    f"Gmail credentials not found at {CREDENTIALS_PATH}.\n"
+                    "Run master_gmail_setup.py first."
+                )
+            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, GMAIL_SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open(TOKEN_PATH, "w") as f:
+            f.write(creds.to_json())
+    return build("gmail", "v1", credentials=creds)
+
+
+# ── File helpers ───────────────────────────────────────────────────────────────
+
+def load_set(path: str) -> set:
+    if not os.path.exists(path):
+        return set()
+    with open(path, encoding="utf-8") as f:
+        return {line.strip() for line in f if line.strip()}
+
+
+def append_to_file(path: str, value: str):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(value.strip() + "\n")
+
+
+# ── Gmail message helpers ──────────────────────────────────────────────────────
+
+# ── Personal/system email filter ───────────────────────────────────────────────
+BLOCKED_EMAIL_DOMAINS = {
+    "indeedemail.com", "sapphirecheck.com", "harvestapp.com",
+    "googlemail.com", "notification.intuit.com", "quickbooks.com",
+}
+BLOCKED_EMAIL_PREFIXES = {
+    "noreply", "no-reply", "billing", "payments", "mailer-daemon",
+    "donotreply", "do-not-reply", "notifications", "support",
+    "bounce", "postmaster",
+}
+BLOCKED_FULL_EMAILS = {
+    "billing@sapphirecheck.com", "sriegercpa@gmail.com",
+    "stonegroupusa@gmail.com",
+}
+
+# [ADDED 2026-07-03] Known BlueLine center/facility contacts (Forest View,
+# Downtown Brooklyn Nursing, Beach Gardens, Riverside Rehab, etc.) were being
+# processed as if they were candidates — confirmed live in cron_output.log
+# (nonsense "DOC DRAFT SAVED ... license: None" output for
+# dp@fvrehab.com / mmeyer@dbnrc.com / mhaynes@bgrehabcare.com /
+# nsathi@theriversiderehab.com). No visible dashboard harm reached (no
+# confident Quo match for a center contact, so no PIPELINE:* tag got pushed),
+# but it wastes a Claude Vision call + a doc-review draft on every real center
+# email. Fixed the same way BLUELINE_EMAIL is excluded above: by sender
+# domain, read from BLUELINE_CENTER_DIRECTORY.md rather than hardcoded here —
+# hardcoding BlueLine's specific 34 centers into shared code would violate
+# 13_DYLAN_PRODUCT_CONSTITUTION.md §6 (BlueLine-specific facts stay in
+# BlueLine's own docs/data, not in generic product code). Cached in-process
+# since the directory doesn't change mid-run; see reset_center_domain_cache()
+# for tests. NOT YET LIVE-VERIFIED against the real file (which lives only on
+# Aditya's Mac, unreachable from this session) — the regex extraction is
+# format-tolerant (any "name@domain.tld" pattern in the raw text) precisely
+# because the file's real internal layout hasn't been confirmed from here;
+# verify the extracted domain set against the real file's known centers
+# before trusting this in production.
+CENTER_DIRECTORY_PATH = Path.home() / "Downloads" / "BlueLine" / "BLUELINE_CENTER_DIRECTORY.md"
+_center_domain_cache = None
+
+
+def reset_center_domain_cache():
+    """Test hook — forces load_center_email_domains() to re-read the file
+    instead of returning a cached result from a prior call/test."""
+    global _center_domain_cache
+    _center_domain_cache = None
+
+
+def load_center_email_domains() -> set:
+    """Returns the set of email domains found anywhere in
+    BLUELINE_CENTER_DIRECTORY.md, so known center/facility senders are never
+    treated as candidates. Returns an empty set (fails open, not closed) if
+    the file doesn't exist — an unreachable directory should degrade to "no
+    extra exclusions," never to accidentally blocking real candidates."""
+    global _center_domain_cache
+    if _center_domain_cache is not None:
+        return _center_domain_cache
+    if not CENTER_DIRECTORY_PATH.exists():
+        log.warning(f"Center directory not found at {CENTER_DIRECTORY_PATH} — "
+                    f"center-domain email exclusion is a no-op until it exists")
+        _center_domain_cache = set()
+        return _center_domain_cache
+    text = CENTER_DIRECTORY_PATH.read_text(encoding="utf-8", errors="replace")
+    emails = re.findall(r"[\w.+-]+@[\w-]+\.[\w.-]+", text)
+    _center_domain_cache = {e.split("@")[-1].lower() for e in emails}
+    return _center_domain_cache
+
+
+def is_system_or_non_candidate_email(email: str) -> bool:
+    """Returns True if this email should be skipped (not a candidate)."""
+    email = email.lower().strip()
+    # [FIXED 2026-07-03] The agency's own address was never explicitly excluded here. As long as
+    # get_unread_messages_all() required is:unread, this never surfaced — Gmail auto-marks an
+    # account's own Sent copies as read, so BLUELINE_EMAIL never matched is:unread and this gap
+    # was invisible. The moment is:unread was dropped (same-day fix, to catch already-read
+    # candidate emails), Sent-mail messages from info@bluelinestaffing.com started coming back
+    # too (the query has no in:inbox restriction), and one got processed as if BlueLine's own
+    # address were "the candidate" (confirmed live: a doc draft got saved for
+    # info@bluelinestaffing.com with license: None). Excluding by sender here (not by adding
+    # -in:sent to the query) is deliberate — a single thread can mix an agency-sent message with a
+    # real candidate reply, and filtering by sender still lets the candidate's own message in that
+    # same thread through.
+    if email == BLUELINE_EMAIL.lower():
+        return True
+    if email in BLOCKED_FULL_EMAILS:
+        return True
+    domain = email.split("@")[-1] if "@" in email else ""
+    if domain in BLOCKED_EMAIL_DOMAINS:
+        return True
+    # [ADDED 2026-07-03] Known center/facility domains — see comment above.
+    if domain in load_center_email_domains():
+        return True
+    prefix = email.split("@")[0] if "@" in email else email
+    if any(prefix.startswith(p) for p in BLOCKED_EMAIL_PREFIXES):
+        return True
+    return False
+
+
+def get_unread_messages_with_attachments(service) -> list:
+    """Kept for reference/back-compat. get_unread_messages_all() below is
+    what run_gmail_doc_review() actually uses as of v1.1 — it covers this
+    same set (attachments included) plus general inquiries."""
+    cutoff = (date.today() - relativedelta(days=7)).strftime("%Y/%m/%d")
+    results = service.users().messages().list(
+        userId="me", q=f"is:unread has:attachment after:{cutoff}"
+    ).execute()
+    refs = results.get("messages", [])
+    output = []
+    for ref in refs:
+        msg = service.users().messages().get(
+            userId="me", id=ref["id"], format="full"
+        ).execute()
+        sender = extract_header(msg, "From")
+        sender_email = extract_email_address(sender)
+        # Filter out system/non-candidate emails
+        if is_system_or_non_candidate_email(sender_email):
+            log.info(f"  Skipping non-candidate email from: {sender_email}")
+            continue
+        output.append((msg, sender_email))
+    return output
+
+
+def get_unread_messages_all(service, days: int = 7) -> list:
+    """[v1.1] ALL emails — attachments or not — within the window.
+    This is the general-inquiry gap fix: the old function only ever saw
+    emails with attachments, so a candidate asking a plain question by
+    email got no automated response of any kind.
+
+    [FIXED 2026-07-03] Dropped the `is:unread` filter. Root-caused this session:
+    Aditya reads his inbox in the normal course of work, so by the time this
+    script runs, the candidate emails it needs to see are almost always
+    already marked read — meaning it was finding 0 candidate emails on every
+    run regardless of whether real onboarding-complete candidates existed,
+    which was the actual reason Doc & Onboarding Stage and Submission Ready
+    showed zero across the dashboards all session. The name keeps saying
+    "unread" for now (not renamed, to avoid touching call sites/behavior
+    beyond the query itself), but the function no longer requires it —
+    dedup against already-handled messages is owned entirely by
+    processed_ids (PROCESSED_EMAILS_PATH), checked by the caller right after
+    this returns, so removing the is:unread requirement here does not risk
+    reprocessing anything already handled."""
+    cutoff = (date.today() - relativedelta(days=days)).strftime("%Y/%m/%d")
+    results = service.users().messages().list(
+        userId="me", q=f"after:{cutoff}"
+    ).execute()
+    refs = results.get("messages", [])
+    output = []
+    for ref in refs:
+        msg = service.users().messages().get(
+            userId="me", id=ref["id"], format="full"
+        ).execute()
+        sender = extract_header(msg, "From")
+        sender_email = extract_email_address(sender)
+        if is_system_or_non_candidate_email(sender_email):
+            log.info(f"  Skipping non-candidate email from: {sender_email}")
+            continue
+        output.append((msg, sender_email))
+    return output
+
+
+def get_all_messages_from_sender(service, sender_email: str) -> list:
+    results = service.users().messages().list(
+        userId="me", q=f"from:{sender_email}"
+    ).execute()
+    refs = results.get("messages", [])
+    messages = []
+    for ref in refs:
+        msg = service.users().messages().get(
+            userId="me", id=ref["id"], format="full"
+        ).execute()
+        messages.append(msg)
+    return messages
+
+
+def get_plain_text_body(message: dict) -> str:
+    """[v1.1] Extracts the plain-text body of a message for the general-inquiry
+    flow. Falls back to the Gmail-provided snippet if no text/plain part is found
+    (e.g. HTML-only emails)."""
+    def walk(payload):
+        mime = payload.get("mimeType", "")
+        body = payload.get("body", {})
+        if mime == "text/plain" and body.get("data"):
+            try:
+                return base64.urlsafe_b64decode(body["data"] + "==").decode("utf-8", errors="replace")
+            except Exception:
+                return ""
+        for part in payload.get("parts", []):
+            result = walk(part)
+            if result:
+                return result
+        return ""
+
+    text = walk(message.get("payload", {}))
+    if text.strip():
+        return text.strip()
+    return message.get("snippet", "").strip()
+
+
+def build_thread_history_text(messages: list, exclude_id: str = None) -> str:
+    """[v1.1] Formats a sender's prior emails (excluding the newest trigger
+    message, which is passed separately as the 'new inbound email') into a
+    readable block for Claude — same spirit as upgrade1's Gmail preview
+    formatting, but with full body text since this is the primary channel
+    for the general-inquiry decision, not a secondary context signal."""
+    lines = []
+    sorted_msgs = sorted(messages, key=lambda m: int(m.get("internalDate", 0)))
+    for msg in sorted_msgs:
+        if exclude_id and msg["id"] == exclude_id:
+            continue
+        date_str = extract_header(msg, "Date")
+        from_str = extract_header(msg, "From")
+        subj_str = extract_header(msg, "Subject")
+        body = get_plain_text_body(msg)[:800]
+        lines.append(f"[{date_str}] FROM: {from_str} | SUBJECT: {subj_str}\n{body}")
+    return "\n\n".join(lines)
+
+
+def extract_header(message: dict, header_name: str) -> str:
+    headers = message.get("payload", {}).get("headers", [])
+    for h in headers:
+        if h.get("name", "").lower() == header_name.lower():
+            return h.get("value", "")
+    return ""
+
+
+def extract_email_address(from_header: str) -> str:
+    match = re.search(r'<([^>]+)>', from_header)
+    if match:
+        return match.group(1).lower().strip()
+    return from_header.lower().strip()
+
+
+def get_parts(payload: dict) -> list:
+    parts = []
+    if payload.get("filename"):
+        parts.append(payload)
+    for part in payload.get("parts", []):
+        parts.extend(get_parts(part))
+    return parts
+
+
+MAX_DOCS_PER_SENDER = 10  # Prevents 413 Payload Too Large on Anthropic API
+
+def get_all_attachments(service, messages: list) -> list:
+    attachments = []
+    for message in messages:
+        if len(attachments) >= MAX_DOCS_PER_SENDER:
+            log.warning(f"  Doc cap of {MAX_DOCS_PER_SENDER} reached — skipping remaining")
+            break
+        parts = get_parts(message.get("payload", {}))
+        for part in parts:
+            if len(attachments) >= MAX_DOCS_PER_SENDER:
+                break
+            filename = part.get("filename", "")
+            mime_type = part.get("mimeType", "")
+            body = part.get("body", {})
+            if not filename:
+                continue
+            ext = Path(filename).suffix.lower()
+            if ext not in {".pdf", ".jpg", ".jpeg", ".png", ".docx", ".doc", ".tiff", ".tif"}:
+                continue
+            att_id = body.get("attachmentId")
+            data_b64 = body.get("data")
+            if att_id:
+                att = service.users().messages().attachments().get(
+                    userId="me", messageId=message["id"], id=att_id
+                ).execute()
+                data_b64 = att.get("data", "")
+            if data_b64:
+                data = base64.urlsafe_b64decode(data_b64 + "==")
+                attachments.append({
+                    "filename": filename,
+                    "data": data,
+                    "mime_type": mime_type,
+                    "message_id": message["id"],
+                })
+    return attachments
+
+
+def mark_as_read(service, message_id: str):
+    service.users().messages().modify(
+        userId="me", id=message_id,
+        body={"removeLabelIds": ["UNREAD"]}
+    ).execute()
+
+
+# ── Claude document analysis ───────────────────────────────────────────────────
+
+def sniff_media_type_from_bytes(data: bytes):
+    """[ADDED 2026-07-03] Returns the real media type based on the file's actual
+    magic-byte signature, not its filename extension — see the call site in
+    analyze_attachments_with_claude() for the live bug this fixes. Only covers
+    the 4 formats this pipeline actually sends to Claude's API (jpeg/png/tiff/
+    pdf); returns None (not a guess) for anything else, including corrupt or
+    truncated data, so the caller can fall back to the extension-based guess
+    rather than this function inventing an answer it isn't sure of."""
+    if not data:
+        return None
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:4] in (b"II*\x00", b"MM\x00*"):
+        return "image/tiff"
+    if data[:5] == b"%PDF-":
+        return "application/pdf"
+    return None
+
+
+def analyze_attachments_with_claude(attachments: list, client) -> dict:
+    if not attachments:
+        return {}
+
+    content_blocks = [{
+        "type": "text",
+        "text": (
+            f"Today's date is {TODAY.strftime('%B %d, %Y')}.\n\n"
+            "You are a document reviewer for BlueLine Staffing, a healthcare staffing agency in New York.\n"
+            "Examine each attached document carefully and extract specific information.\n\n"
+            "For each document, identify:\n"
+            "1. What type of document it is\n"
+            "2. The candidate's full name (if visible)\n"
+            "3. Any relevant dates (issue date, expiry date, exam date, test date)\n"
+            "4. The issuing authority or state\n"
+            "5. Any license type (CNA, LPN, RN)\n"
+            "6. Any restrictions on the document\n\n"
+            "CRITICAL RULE FOR PHYSICAL: Identify ONLY the 'Date of Examination' or 'Date of Patient Exam' "
+            "— the actual date the doctor examined the patient. Ignore all other dates.\n\n"
+            "Respond ONLY with a valid JSON object — no markdown, no preamble:\n"
+            "{\n"
+            '  "candidate_name": "string or null",\n'
+            '  "nursing_license": {"found": true/false, "type": "CNA"|"LPN"|"RN"|null, '
+            '"state": "string or null", "expiry_date": "YYYY-MM-DD or null", "is_valid": true/false},\n'
+            '  "resume": {"found": true/false},\n'
+            '  "ids": [{"document_type": "string", "i9_list": "A"|"B"|"C"|"unknown", '
+            '"expiry_date": "YYYY-MM-DD or null", "is_expired": true/false, "restrictions": "string or null"}],\n'
+            '  "physical": {"found": true/false, "exam_date": "YYYY-MM-DD or null", "months_ago": number or null},\n'
+            '  "mmr_titers": {"found": true/false, "test_date": "YYYY-MM-DD or null", '
+            '"years_ago": number or null, "result": "immune"|"not immune"|"unknown"},\n'
+            '  "varicella_titers": {"found": true/false, "test_date": "YYYY-MM-DD or null", '
+            '"years_ago": number or null, "result": "immune"|"not immune"|"unknown"},\n'
+            '  "chest_xray": {"found": true/false, "date": "YYYY-MM-DD or null", "months_ago": number or null},\n'
+            '  "ppd": {"found": true/false, "date": "YYYY-MM-DD or null", "months_ago": number or null},\n'
+            '  "quantiferon": {"found": true/false, "date": "YYYY-MM-DD or null", "months_ago": number or null},\n'
+            '  "covid_vaccine": {"found": true/false, "source": "vaccine card"|"immunization record"|"physical"|"other"|null},\n'
+            '  "hepatitis_b": {"found": true/false, "source": "vaccine card"|"immunization record"|"titer"|'
+            '"declination form"|"other"|null},\n'
+            '  "flu_vaccine": {"found": true/false, "season": "string or null", '
+            '"source": "vaccine card"|"immunization record"|"declination form"|"other"|null},\n'
+            '  "bls_cpr": {"found": true/false},\n'
+            '  "employment_application": {"found": true/false, "signed": true/false, '
+            '"is_blueline_onboarding_form": true/false}\n'
+            "}\n\n"
+            "For employment_application: this is BlueLine's own onboarding/application form "
+            "coming BACK from the candidate (filled in and signed), not a form BlueLine sent OUT. "
+            "Look for a candidate signature, filled-in fields (name, SSN, address, dates), and any "
+            "BlueLine Staffing letterhead or form title. found=true only if this specific document "
+            "type is present; signed=true only if a signature/initials are visible on it.\n\n"
+            "Only mark found=true if clearly visible. Return null for anything unconfirmed."
+        )
+    }]
+
+    for att in attachments:
+        ext = Path(att["filename"]).suffix.lower()
+        if ext in {".jpg", ".jpeg"}:
+            media_type = "image/jpeg"
+        elif ext == ".png":
+            media_type = "image/png"
+        elif ext in {".tiff", ".tif"}:
+            media_type = "image/tiff"
+        elif ext == ".pdf":
+            media_type = "application/pdf"
+        else:
+            content_blocks.append({"type": "text",
+                "text": f"[Document: {att['filename']} — classify by filename if possible]"})
+            continue
+
+        # [ADDED 2026-07-03] Real, live failure found in cron_output.log: a document from
+        # mmeyer@dbnrc.com failed with "400 Bad Request: ... The image was specified using the
+        # image/png media type, but the image appears to be a image/jpeg image" — the code above
+        # trusts the FILENAME EXTENSION, not the actual bytes, and Claude's API correctly rejects
+        # a mismatch. This is a silent per-attachment loss: a real candidate document could fail
+        # the same way and get dropped with no signal beyond a log line. Fixed by sniffing the
+        # actual magic bytes and preferring that over the extension guess whenever they disagree —
+        # see sniff_media_type_from_bytes() below. Falls back to the extension guess if the bytes
+        # don't match any known signature (e.g. a corrupt/truncated file) rather than dropping the
+        # attachment outright.
+        sniffed = sniff_media_type_from_bytes(att["data"])
+        if sniffed is not None and sniffed != media_type:
+            log.warning(
+                f"  {att['filename']}: extension implied {media_type} but the actual file bytes "
+                f"are {sniffed} — using the sniffed type so Claude's API doesn't reject the mismatch."
+            )
+            media_type = sniffed
+
+        data_b64 = base64.standard_b64encode(att["data"]).decode("utf-8")
+
+        if media_type == "application/pdf":
+            content_blocks.append({
+                "type": "document",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": data_b64}
+            })
+        else:
+            content_blocks.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": data_b64}
+            })
+        content_blocks.append({"type": "text", "text": f"[Filename: {att['filename']}]"})
+
+    try:
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": content_blocks}]
+        )
+        raw = response.content[0].text.strip()
+        raw = re.sub(r"^```(?:json)?", "", raw).strip()
+        raw = re.sub(r"```$", "", raw).strip()
+        return json.loads(raw)
+    except Exception as e:
+        log.error(f"Claude document analysis failed: {e}")
+        return {}
+
+
+# ── Document validation ────────────────────────────────────────────────────────
+
+def validate_documents(analysis: dict) -> dict:
+    results = {}
+
+    # Resume
+    resume = analysis.get("resume", {})
+    results["resume"] = {
+        "ok": resume.get("found", False),
+        "label": "Updated Resume",
+        "note": None if resume.get("found") else "Missing",
+    }
+
+    # Nursing License
+    lic = analysis.get("nursing_license", {})
+    lic_found  = lic.get("found", False)
+    lic_type   = lic.get("type")
+    lic_state  = (lic.get("state") or "").upper()
+    lic_valid  = lic.get("is_valid", False)
+    lic_expiry = lic.get("expiry_date")
+    lic_state_ok = "NEW YORK" in lic_state or "NY" in lic_state
+
+    if not lic_found:
+        results["nursing_license"] = {"ok": False, "label": "Nursing License", "note": "Missing", "type": None}
+    elif not lic_state_ok:
+        results["nursing_license"] = {"ok": False, "label": "Nursing License",
+            "note": f"License issued by '{lic.get('state')}' — must be New York State", "type": lic_type}
+    elif not lic_valid:
+        results["nursing_license"] = {"ok": False, "label": "Nursing License",
+            "note": f"License appears expired (expiry: {lic_expiry})", "type": lic_type}
+    else:
+        results["nursing_license"] = {"ok": True, "label": f"Nursing License ({lic_type})",
+            "note": None, "type": lic_type}
+
+    # ID Documents (I-9)
+    ids = analysis.get("ids", [])
+    list_a_docs = [d for d in ids if d.get("i9_list") == "A" and not d.get("is_expired")]
+    list_b_docs = [d for d in ids if d.get("i9_list") == "B" and not d.get("is_expired")]
+    list_c_docs = [d for d in ids if d.get("i9_list") == "C" and not d.get("is_expired")]
+    valid_list_c = [d for d in list_c_docs if not any(
+        r in (d.get("restrictions") or "").lower() for r in SS_INVALID_RESTRICTIONS
+    )]
+    i9_ok = bool(list_a_docs) or (bool(list_b_docs) and bool(valid_list_c))
+
+    if list_a_docs:
+        i9_note = f"List A: {list_a_docs[0].get('document_type')}"
+    elif list_b_docs and valid_list_c:
+        i9_note = f"List B: {list_b_docs[0].get('document_type')} + List C: {valid_list_c[0].get('document_type')}"
+    elif list_b_docs:
+        i9_note = "List B present but no valid List C — need Social Security card, birth certificate, or equivalent"
+    elif valid_list_c:
+        i9_note = "List C present but no List B (photo ID) — need driver's license or state ID"
+    elif ids:
+        i9_note = "IDs submitted but could not be classified — please resubmit clearer copies"
+    else:
+        i9_note = "No ID documents submitted"
+
+    results["id_documents"] = {"ok": i9_ok, "label": "Two Forms of ID (I-9)", "note": None if i9_ok else i9_note}
+
+    # Physical
+    phys = analysis.get("physical", {})
+    phys_found  = phys.get("found", False)
+    phys_months = phys.get("months_ago")
+    phys_date   = phys.get("exam_date")
+
+    if not phys_found:
+        results["physical"] = {"ok": False, "label": "Physical Exam", "note": "Missing"}
+    elif phys_months is None:
+        results["physical"] = {"ok": False, "label": "Physical Exam",
+            "note": "Physical submitted but exam date unclear — please confirm date"}
+    elif phys_months > MAX_PHYSICAL_MONTHS:
+        results["physical"] = {"ok": False, "label": "Physical Exam",
+            "note": f"Physical dated {phys_date} is more than 12 months old — must be within the last year"}
+    else:
+        results["physical"] = {"ok": True, "label": "Physical Exam", "note": None}
+
+    # MMR Titers
+    mmr = analysis.get("mmr_titers", {})
+    mmr_found  = mmr.get("found", False)
+    mmr_years  = mmr.get("years_ago")
+    mmr_result = mmr.get("result", "unknown")
+    mmr_date   = mmr.get("test_date")
+
+    if not mmr_found:
+        results["mmr_titers"] = {"ok": False, "label": "MMR Titers", "note": "Missing"}
+    elif mmr_result == "not immune":
+        results["mmr_titers"] = {"ok": False, "label": "MMR Titers",
+            "note": "MMR shows non-immunity — updated immunization or re-test required"}
+    elif mmr_years is not None and mmr_years > MAX_TITER_YEARS:
+        results["mmr_titers"] = {"ok": False, "label": "MMR Titers",
+            "note": f"MMR titer dated {mmr_date} is more than 5 years old"}
+    else:
+        results["mmr_titers"] = {"ok": True, "label": "MMR Titers", "note": None}
+
+    # Varicella Titers
+    var = analysis.get("varicella_titers", {})
+    var_found  = var.get("found", False)
+    var_years  = var.get("years_ago")
+    var_result = var.get("result", "unknown")
+    var_date   = var.get("test_date")
+
+    if not var_found:
+        results["varicella_titers"] = {"ok": False, "label": "Varicella Titers", "note": "Missing"}
+    elif var_result == "not immune":
+        results["varicella_titers"] = {"ok": False, "label": "Varicella Titers",
+            "note": "Varicella shows non-immunity — updated immunization or re-test required"}
+    elif var_years is not None and var_years > MAX_TITER_YEARS:
+        results["varicella_titers"] = {"ok": False, "label": "Varicella Titers",
+            "note": f"Varicella titer dated {var_date} is more than 5 years old"}
+    else:
+        results["varicella_titers"] = {"ok": True, "label": "Varicella Titers", "note": None}
+
+    # Chest X-Ray + PPD or Quantiferon
+    cxr = analysis.get("chest_xray", {})
+    ppd = analysis.get("ppd", {})
+    qft = analysis.get("quantiferon", {})
+
+    cxr_ok = cxr.get("found") and (cxr.get("months_ago") or 99) <= MAX_CHEST_PPD_MONTHS
+    ppd_ok = ppd.get("found") and (ppd.get("months_ago") or 99) <= MAX_CHEST_PPD_MONTHS
+    qft_ok = qft.get("found") and (qft.get("months_ago") or 99) <= MAX_CHEST_PPD_MONTHS
+    chest_ok = (cxr_ok and ppd_ok) or qft_ok
+
+    if not cxr.get("found") and not ppd.get("found") and not qft.get("found"):
+        chest_note = "Missing — need either (Chest X-Ray + PPD) or Quantiferon, within 9 months"
+    elif qft_ok or (cxr_ok and ppd_ok):
+        chest_note = None
+    elif cxr.get("found") and not ppd.get("found") and not qft_ok:
+        chest_note = "Chest X-Ray received but PPD missing — add PPD or submit Quantiferon instead"
+    elif ppd.get("found") and not cxr.get("found") and not qft_ok:
+        chest_note = "PPD received but Chest X-Ray missing — add Chest X-Ray or submit Quantiferon instead"
+    elif cxr.get("found") and not cxr_ok:
+        chest_note = f"Chest X-Ray dated {cxr.get('date')} is more than 9 months old"
+    elif ppd.get("found") and not ppd_ok:
+        chest_note = f"PPD dated {ppd.get('date')} is more than 9 months old"
+    elif qft.get("found") and not qft_ok:
+        chest_note = f"Quantiferon dated {qft.get('date')} is more than 9 months old"
+    else:
+        chest_note = "Chest/TB documentation incomplete — need (Chest X-Ray + PPD) or Quantiferon within 9 months"
+
+    results["chest_tb"] = {"ok": chest_ok, "label": "Chest X-Ray + PPD or Quantiferon", "note": chest_note}
+
+    # Covid Vaccine
+    covid = analysis.get("covid_vaccine", {})
+    results["covid_vaccine"] = {
+        "ok": covid.get("found", False),
+        "label": "Covid Vaccine",
+        "note": None if covid.get("found") else "Missing — vaccine card or immunization/physical records accepted",
+    }
+
+    # BLS/CPR (optional)
+    bls = analysis.get("bls_cpr", {})
+    results["bls_cpr"] = {
+        "ok": bls.get("found", False),
+        "label": "BLS/CPR Certification",
+        "note": "Not submitted — preferred but not required to proceed" if not bls.get("found") else None,
+        "optional": True,
+    }
+
+    # Hepatitis B (optional — recommended per OSHA bloodborne pathogen exposure standard,
+    # but a signed declination is an accepted alternative, so this cannot be a blocking
+    # requirement without also being able to detect a valid declination form as a pass.
+    # [ADDED 2026-07-01 per Aditya's explicit product decision: recommended, not mandatory.])
+    hep_b = analysis.get("hepatitis_b", {})
+    hep_b_found  = hep_b.get("found", False)
+    hep_b_source = hep_b.get("source")
+    results["hepatitis_b"] = {
+        "ok": hep_b_found,
+        "label": "Hepatitis B Vaccine / Declination",
+        "note": (
+            "Not submitted — recommended (OSHA bloodborne pathogen exposure standard) but not "
+            "required to proceed" if not hep_b_found
+            else (f"On file via {hep_b_source}" if hep_b_source else None)
+        ),
+        "optional": True,
+    }
+
+    # Annual Flu Vaccine (optional — same reasoning as Hepatitis B: declination is a valid
+    # alternative to vaccination, so this is recommended, not a blocking requirement.
+    # [ADDED 2026-07-01 per Aditya's explicit product decision: recommended, not mandatory.])
+    flu = analysis.get("flu_vaccine", {})
+    flu_found  = flu.get("found", False)
+    flu_source = flu.get("source")
+    results["flu_vaccine"] = {
+        "ok": flu_found,
+        "label": "Annual Flu Vaccine / Declination",
+        "note": (
+            "Not submitted — recommended (current flu season) but not required to proceed"
+            if not flu_found
+            else (f"On file via {flu_source}" if flu_source else None)
+        ),
+        "optional": True,
+    }
+
+    # Employment/onboarding application returned by the candidate (v1.2, NEW).
+    # Tracked separately from the 8 medical-doc categories above — this is what
+    # distinguishes a "hot" file (docs complete, onboarding sent, awaiting return)
+    # from a "submission-ready" file (docs complete AND onboarding returned).
+    # Deliberately NOT counted in `all_required` for compose_reply_email's
+    # "documents complete" gate — that gate is about MEDICAL doc completeness,
+    # which is what triggers sending the onboarding form out in the first place.
+    app = analysis.get("employment_application", {})
+    app_found  = app.get("found", False)
+    app_signed = app.get("signed", False)
+    results["employment_application"] = {
+        "ok": app_found and app_signed,
+        "label": "Signed Onboarding Application",
+        "note": (
+            None if (app_found and app_signed)
+            else ("Received but not signed — please confirm signature" if app_found
+                  else "Not yet returned")
+        ),
+        "optional": True,   # never blocks the medical "documents complete" email
+        "tracked_separately": True,
+    }
+
+    return results
+
+
+# ── Pipeline stage (v1.2, NEW) ─────────────────────────────────────────────────
+
+def compute_pipeline_stage(validation_results: dict) -> str:
+    """
+    Reduces a candidate's validation_results down to ONE stage tag, written to
+    their Quo contact's `role` field so a live dashboard can read real pipeline
+    status without re-running Vision analysis or re-scanning Gmail every time.
+
+    Stages (see 05_PIPELINE_REFERENCE.md STEP 6 for the authoritative list):
+      PIPELINE:DOCS_INCOMPLETE                                — still missing required medical docs
+      PIPELINE:DOCS_COMPLETE_ONBOARD_SENT                     — "hot file": medical docs done,
+                                                                  onboarding form sent, awaiting return
+      PIPELINE:ONBOARD_RETURNED_READY_FOR_SUBMISSION          — "submission file": both done,
+                                                                  ready to consolidate + send to centers
+
+    NOTE: no "|" characters in any tag (fixed 2026-07-02) — the Quo API's own
+    text renderers use "|" as a field delimiter without escaping, so a "|"
+    inside role would corrupt every downstream reader's column alignment.
+
+    Does NOT set PIPELINE:SUBMITTED — that is only ever set by
+    master_candidate_file_consolidator.py, after Aditya has actually reviewed
+    and sent the per-center draft(s). This function never claims a submission
+    happened.
+    """
+    medical_keys   = [k for k, v in validation_results.items()
+                      if not v.get("optional") and k != "employment_application"]
+    medical_missing = [k for k in medical_keys if not validation_results[k]["ok"]]
+    medical_complete = len(medical_missing) == 0
+
+    onboarding_returned = validation_results.get("employment_application", {}).get("ok", False)
+
+    if not medical_complete:
+        return STAGE_DOCS_INCOMPLETE
+    if medical_complete and not onboarding_returned:
+        return STAGE_DOCS_COMPLETE_SENT
+    return STAGE_READY_FOR_SUBMISSION
+
+
+def push_candidate_status_to_quo(
+    sender_email: str,
+    sender_display_name: str,
+    stage: str,
+    email_body_text: str = "",
+) -> bool:
+    """
+    Looks up the candidate's Quo contact and PATCHes their `role` field to
+    the given stage tag.
+
+    [UPDATED 2026-07-02, per Aditya's request] Contact resolution now goes
+    through email_context_bridge.resolve_candidate_contact(), which tries
+    phone number first (extracted from email_body_text, if any — exact,
+    unambiguous), then the sender's email address on file, and only then
+    falls back to fuzzy name matching (match_phone_by_sender_name, BUG-21
+    fixed) as the last resort. Previously this called match_phone_by_sender_name
+    directly, which is exactly what caused the confirmed live miss on
+    2026-07-02 14:49 (Sarina Marie Escalera vs Quo's "Sarina Escalera") —
+    that specific case is now also fixed at the name-matching layer, but the
+    phone-first tier means cases like it won't even reach name matching
+    going forward whenever the candidate's number appears in their email.
+
+    Returns True on confirmed success, False on any failure (missing API key,
+    no confident contact match, or a non-2xx response) — callers should log
+    but never treat a False return as fatal; this is a visibility feature,
+    not a pipeline-blocking one.
+
+    STATUS: v1.5 phone-first resolution added 2026-07-02. Verified via real
+    unit tests (see tests/test_pipeline_logic.py) with a phone-number-in-
+    signature fixture proving the phone tier fires before name matching is
+    ever attempted — not yet observed end-to-end against a live email that
+    actually contains a phone number (the one real run so far, Sarina
+    Escalera, did not include her phone in the email body). Confirm on the
+    next real candidate email that includes a phone number.
+    """
+    if not QUO_API_KEY:
+        log.warning("  QUO_API_KEY not set — cannot push pipeline stage to Quo")
+        return False
+
+    match = resolve_candidate_contact(sender_email, sender_display_name, email_body_text)
+    if not match:
+        log.warning(f"  No confident Quo contact match for '{sender_display_name}' "
+                    f"({sender_email}) — stage '{stage}' not pushed")
+        return False
+
+    phone, _first, _last = match
+    headers = {"Authorization": QUO_API_KEY, "Content-Type": "application/json"}
+    try:
+        # [FIX 2026-07-02, Round 9C — found while live-verifying Round 9B]
+        # This used to call requests.get(.../contacts, pageSize=100) directly —
+        # ONE unpaginated page, out of ~3,794 total contacts (~2.6% coverage).
+        # match_phone_by_sender_name() above searches the FULL contact list (via
+        # the paginated + cached _quo_get_all_contacts()) and can find a phone
+        # that lives anywhere in that list, but this ID-resolution step was then
+        # only looking in the first 100 — so for the ~97% of matches outside
+        # page 1, this would log "could not resolve a contact ID" and silently
+        # drop the dashboard stage push even though the match itself succeeded.
+        # Fix: reuse the same cached, fully-paginated contact list instead of a
+        # second, narrower fetch — also means this call is normally free (cache
+        # hit) since match_phone_by_sender_name() just populated/used it.
+        contact_id = None
+        for c in _quo_get_all_contacts():
+            for p in (c.get("defaultFields", {}).get("phoneNumbers") or []):
+                if (p.get("value") or p.get("phoneNumber") or "").strip() == phone.strip():
+                    contact_id = c.get("id")
+                    break
+            if contact_id:
+                break
+        if not contact_id:
+            log.warning(f"  Matched phone {phone} but could not resolve a contact ID — stage not pushed")
+            return False
+
+        patch = requests.patch(
+            f"{QUO_BASE_URL}/contacts/{contact_id}",
+            headers=headers,
+            json={"defaultFields": {"role": stage}},
+            timeout=15,
+        )
+        if not patch.ok:
+            log.warning(f"  Quo PATCH {patch.status_code} pushing stage '{stage}' to {contact_id}: "
+                        f"{patch.text[:150]}")
+            return False
+        log.info(f"  Pipeline stage pushed: {sender_display_name} ({phone}) -> {stage}")
+        return True
+    except Exception as e:
+        log.warning(f"  Error pushing pipeline stage for {sender_display_name}: {e}")
+        return False
+
+
+# ── Application file selection ─────────────────────────────────────────────────
+
+def get_application_file(license_type: str) -> list:
+    rn_path  = os.path.join(DESKTOP_APPS_DIR, APP_RN)
+    lpn_path = os.path.join(DESKTOP_APPS_DIR, APP_LPN)
+    cna_path = os.path.join(DESKTOP_APPS_DIR, APP_CNA)
+    if license_type == "RN":
+        return [(rn_path, APP_RN)]
+    elif license_type == "LPN":
+        return [(lpn_path, APP_LPN)]
+    elif license_type == "CNA":
+        return [(cna_path, APP_CNA)]
+    return []
+
+
+# ── Email composition ──────────────────────────────────────────────────────────
+
+def compose_reply_email(to_address, candidate_name, validation_results, license_type, original_subject) -> MIMEMultipart:
+    all_required      = [k for k, v in validation_results.items() if not v.get("optional")]
+    missing_required  = [k for k in all_required if not validation_results[k]["ok"]]
+    all_complete      = len(missing_required) == 0
+    license_known     = license_type in ("CNA", "LPN", "RN")
+    name_str          = candidate_name if candidate_name else "there"
+
+    received_lines, missing_lines, notes_lines = [], [], []
+
+    for key, val in validation_results.items():
+        label, ok, note, optional = val["label"], val["ok"], val.get("note"), val.get("optional", False)
+        if ok:
+            received_lines.append(f"  \u2713 {label}")
+        elif optional:
+            notes_lines.append(f"  \u25cb {label}: {note}")
+        else:
+            missing_lines.append(f"  \u2717 {label}: {note}" if note else f"  \u2717 {label}")
+
+    if all_complete and license_known:
+        subject    = f"Re: {original_subject} — Documents Received"
+        body_intro = (
+            f"Hi {name_str},\n\n"
+            "Thank you for sending through your documents. We have reviewed everything and your file is complete.\n\n"
+            "Please find the employment application attached. Kindly complete and return it at your earliest "
+            "convenience so we can move your placement forward.\n"
+        )
+    else:
+        subject    = f"Re: {original_subject} — Documents Update"
+        body_intro = (
+            f"Hi {name_str},\n\n"
+            "Thank you for sending through your documents. We have reviewed what we have received so far.\n\n"
+        )
+
+    body = body_intro
+    if received_lines:
+        body += "Received:\n" + "\n".join(received_lines) + "\n\n"
+    if missing_lines:
+        body += "Still required:\n" + "\n".join(missing_lines) + "\n\n"
+    if notes_lines:
+        body += "Notes:\n" + "\n".join(notes_lines) + "\n\n"
+
+    if not license_known:
+        body += (
+            "We are not yet able to send through the employment application as we have not received "
+            "a copy of your nursing license. Please send us your current New York State nursing license "
+            "(CNA, LPN, or RN) and we will issue the relevant application immediately.\n\n"
+            "Once we have your license and all remaining documents, we can move your placement forward quickly.\n"
+        )
+    elif not all_complete:
+        body += (
+            "Once we have everything in, we can move quickly on your placement.\n"
+            "Please attach all remaining documents in a single follow-up email.\n\n"
+            "We have also attached the employment application — please complete and return it along "
+            "with your outstanding documents.\n"
+        )
+
+    body += (
+        "\nShould you have any questions, please do not hesitate to reach out.\n\n"
+        "Thanks\n"
+        "Dylan\n"
+        "Blue Line Staffing\n"
+        "info@bluelinestaffing.com"
+    )
+
+    msg = MIMEMultipart()
+    msg["To"]      = to_address
+    msg["From"]    = BLUELINE_EMAIL
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    if license_known:
+        for filepath, filename in get_application_file(license_type):
+            if not os.path.exists(filepath):
+                log.warning(f"Application file not found: {filepath}")
+                continue
+            with open(filepath, "rb") as f:
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(f.read())
+                encoders.encode_base64(part)
+                part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
+                msg.attach(part)
+
+    return msg
+
+
+# ── DRAFT (not send) ──────────────────────────────────────────────────────────
+
+def save_as_draft(service, reply_msg: MIMEMultipart, thread_id: str):
+    """Saves the composed email as a Gmail Draft. Does NOT send."""
+    raw = base64.urlsafe_b64encode(reply_msg.as_bytes()).decode()
+    draft_body = {"message": {"raw": raw, "threadId": thread_id}}
+    draft = service.users().drafts().create(userId="me", body=draft_body).execute()
+    return draft.get("id")
+
+
+def compose_general_reply_email(to_address: str, subject: str, draft_body: str) -> MIMEMultipart:
+    """[v1.1] Plain-text reply for the general-inquiry flow (no PDF attachment
+    — that's only for the document-review flow above)."""
+    msg = MIMEMultipart()
+    msg["To"]      = to_address
+    msg["From"]    = BLUELINE_EMAIL
+    msg["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+    msg.attach(MIMEText(draft_body, "plain"))
+    return msg
+
+
+def append_email_flag(sender_email: str, sender_name: str, subject: str, reason: str, snippet: str):
+    """[v1.1] Email-side equivalent of master_needs_human_review.txt — kept as
+    its own file (EMAIL_NEEDS_HUMAN_REVIEW_PATH) so SMS and email flags never
+    mix formats in the same file."""
+    entry = (
+        f"{datetime.now().isoformat()} | {sender_name or '(unknown)'} <{sender_email}> | "
+        f"SUBJECT: {subject} | REASON: {reason} | PREVIEW: {snippet[:200]}"
+    )
+    append_to_file(EMAIL_NEEDS_HUMAN_REVIEW_PATH, entry)
+
+
+# ── Sender processing (shared by batch mode and the real-time listener) ───────
+
+def process_sender(service, client, sender_email: str, trigger_messages: list) -> dict:
+    """
+    [v1.1] Handles everything for one sender's unread email(s):
+      - If any document attachments are present anywhere in their email
+        history -> existing Claude Vision doc-review flow (unchanged).
+      - Otherwise -> general-inquiry flow via email_context_bridge.py
+        (checks Gmail history + Quo SMS history, drafts/skips/flags).
+
+    Always marks the trigger messages as read and processed, regardless of
+    which branch fires or what the outcome was — this is what makes it safe
+    to call repeatedly (batch re-scan or real-time listener) without
+    duplicate action.
+
+    Returns: {"outcome": "doc_draft"|"email_draft"|"flagged"|"skipped"|"error"}
+    """
+    log.info(f"  Processing sender: {sender_email}")
+
+    all_sender_messages = get_all_messages_from_sender(service, sender_email)
+    all_attachments = get_all_attachments(service, all_sender_messages)
+
+    doc_attachments = [
+        a for a in all_attachments
+        if Path(a["filename"]).suffix.lower() in {".pdf", ".jpg", ".jpeg", ".png", ".docx", ".tiff", ".tif"}
+    ]
+
+    latest_trigger = sorted(
+        trigger_messages, key=lambda m: int(m.get("internalDate", 0)), reverse=True
+    )[0]
+    thread_id        = latest_trigger.get("threadId", "")
+    original_subject = extract_header(latest_trigger, "Subject") or "Your Message"
+    from_header       = extract_header(latest_trigger, "From")
+    sender_name       = extract_display_name(from_header)
+
+    outcome = "skipped"
+
+    if doc_attachments:
+        # ── EXISTING FLOW: document review (unchanged behavior) ──
+        log.info(f"    Analysing {len(doc_attachments)} document(s)")
+        analysis = analyze_attachments_with_claude(doc_attachments, client)
+
+        if not analysis:
+            log.warning(f"    Claude returned no analysis for {sender_email}")
+            outcome = "error"
+        else:
+            validation     = validate_documents(analysis)
+            candidate_name = analysis.get("candidate_name")
+            license_type   = (analysis.get("nursing_license") or {}).get("type")
+
+            reply = compose_reply_email(
+                to_address=sender_email,
+                candidate_name=candidate_name,
+                validation_results=validation,
+                license_type=license_type,
+                original_subject=original_subject,
+            )
+            try:
+                draft_id = save_as_draft(service, reply, thread_id)
+                log.info(f"    DOC DRAFT SAVED (id={draft_id}) for {sender_email} (license: {license_type})")
+                outcome = "doc_draft"
+            except Exception as e:
+                log.error(f"    Failed to save doc draft for {sender_email}: {e}")
+                outcome = "error"
+
+            # [v1.2, NEW] Push pipeline stage to Quo regardless of draft success —
+            # the stage reflects document reality, not whether the reply draft saved.
+            # [v1.5, NEW] Combine plain-text bodies from ALL of this sender's messages
+            # (not just the latest trigger) so a phone number mentioned anywhere in the
+            # thread — e.g. an earlier "here's my number, 551-555-0100" — is still found
+            # by resolve_candidate_contact()'s phone-first tier, not just today's email.
+            combined_body_text = "\n".join(
+                get_plain_text_body(m) for m in all_sender_messages
+            )
+            stage = compute_pipeline_stage(validation)
+            pushed = push_candidate_status_to_quo(
+                sender_email=sender_email,
+                sender_display_name=candidate_name or sender_name,
+                stage=stage,
+                email_body_text=combined_body_text,
+            )
+            if not pushed:
+                log.warning(f"    Stage '{stage}' computed for {sender_email} but NOT pushed to Quo "
+                            f"— dashboard will not reflect this candidate's real status until resolved")
+    else:
+        # ── [v1.1] NEW FLOW: general inquiry, cross-channel context ──
+        inbound_body = get_plain_text_body(latest_trigger)
+        thread_history_text = build_thread_history_text(all_sender_messages, exclude_id=latest_trigger["id"])
+
+        log.info(f"    No attachments — routing '{sender_email}' through cross-channel context bridge")
+        decision = get_context_aware_email_reply(
+            sender_name=sender_name,
+            sender_email=sender_email,
+            subject=original_subject,
+            inbound_body=inbound_body,
+            gmail_thread_history=thread_history_text,
+        )
+
+        if decision["decision"] == "DRAFT":
+            reply = compose_general_reply_email(sender_email, original_subject, decision["draft_body"])
+            try:
+                draft_id = save_as_draft(service, reply, thread_id)
+                log.info(f"    EMAIL DRAFT SAVED (id={draft_id}) for {sender_email}")
+                outcome = "email_draft"
+            except Exception as e:
+                log.error(f"    Failed to save email draft for {sender_email}: {e}")
+                outcome = "error"
+        elif decision["decision"] == "FLAG_HUMAN_OPTOUT":
+            # [ADDED 2026-07-02, Round 6 — closes KNOWN GAP #1] Still flagged
+            # for human visibility (nothing here changes the "human sees every
+            # flag" invariant), but email_context_bridge.py has already
+            # attempted the SMS-side sync — log exactly what happened rather
+            # than assuming it worked.
+            sync = decision.get("sync_result") or {}
+            sync_note = (
+                f"SMS opt-out sync: {'OK' if sync.get('synced') else 'FAILED/NOT POSSIBLE'} "
+                f"({sync.get('reason', 'no sync attempted')})"
+            )
+            append_email_flag(
+                sender_email, sender_name, original_subject,
+                f"{decision['reason']} | {sync_note}", inbound_body,
+            )
+            log.info(f"    FLAGGED (OPT-OUT): {sender_email} — {decision['reason']} — {sync_note}")
+            outcome = "flagged_optout_synced" if sync.get("synced") else "flagged_optout_sync_failed"
+        elif decision["decision"] == "FLAG_HUMAN":
+            append_email_flag(sender_email, sender_name, original_subject, decision["reason"], inbound_body)
+            log.info(f"    FLAGGED FOR HUMAN REVIEW: {sender_email} — {decision['reason']}")
+            outcome = "flagged"
+        else:
+            log.info(f"    SKIPPED: {sender_email} — {decision.get('reason', '')}")
+            outcome = "skipped"
+
+    for msg in trigger_messages:
+        mark_as_read(service, msg["id"])
+        append_to_file(PROCESSED_EMAILS_PATH, msg["id"])
+
+    return {"outcome": outcome}
+
+
+def process_new_message_by_id(service, client, msg_id: str) -> dict:
+    """
+    [v1.1] Entry point for master_gmail_pubsub_listener.py — processes ONE
+    newly-arrived message (discovered via Gmail history.list(), not a full
+    unread re-scan) through the same logic as the batch path above.
+
+    Safe to call even if the message turns out to already be processed or
+    to be from a filtered sender — it will no-op in those cases.
+    """
+    processed_ids = load_set(PROCESSED_EMAILS_PATH)
+    if msg_id in processed_ids:
+        return {"outcome": "already_processed"}
+
+    try:
+        msg = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
+    except Exception as e:
+        log.warning(f"  Could not fetch message {msg_id}: {e}")
+        return {"outcome": "error"}
+
+    # Only act on messages still unread and actually in the inbox (avoids
+    # reacting to Dylan's own sent mail or drafts triggering a history event)
+    label_ids = msg.get("labelIds", [])
+    if "UNREAD" not in label_ids or "SENT" in label_ids or "DRAFT" in label_ids:
+        return {"outcome": "not_applicable"}
+
+    sender = extract_header(msg, "From")
+    sender_email = extract_email_address(sender)
+    if is_system_or_non_candidate_email(sender_email):
+        log.info(f"  Skipping non-candidate email from: {sender_email}")
+        return {"outcome": "filtered"}
+
+    return process_sender(service, client, sender_email, [msg])
+
+
+# ── Main entry point ───────────────────────────────────────────────────────────
+
+def run_gmail_doc_review():
+    log.info("=== GMAIL DOC REVIEW: Starting (DRAFT MODE — nothing will be sent) ===")
+
+    app_files_to_check = [
+        os.path.join(DESKTOP_APPS_DIR, APP_RN),
+        os.path.join(DESKTOP_APPS_DIR, APP_LPN),
+        os.path.join(DESKTOP_APPS_DIR, APP_CNA),
+    ]
+    missing_at_startup = [p for p in app_files_to_check if not os.path.exists(p)]
+    if missing_at_startup:
+        log.error(
+            "GMAIL REVIEW ABORTED — employment application files missing:\n"
+            + "\n".join(missing_at_startup)
+        )
+        return
+
+    try:
+        service = get_gmail_service()
+    except FileNotFoundError as e:
+        log.error(f"Gmail auth error: {e}")
+        return
+
+    client = get_claude_client()
+    processed_ids = load_set(PROCESSED_EMAILS_PATH)
+    unread = get_unread_messages_all(service)  # [v1.1] was get_unread_messages_with_attachments
+    # [FIXED 2026-07-03] Log text corrected — this no longer requires is:unread (see function
+    # docstring), so "unread" here was misleading as of this fix.
+    log.info(f"  Found {len(unread)} candidate email(s) in window (read or unread, attachments + general inquiries)")
+
+    senders_seen = {}
+    for msg, sender_email in unread:
+        msg_id = msg["id"]
+        if msg_id in processed_ids:
+            continue
+        senders_seen.setdefault(sender_email, []).append(msg)
+
+    tally = {"doc_draft": 0, "email_draft": 0, "flagged": 0, "skipped": 0, "error": 0}
+
+    for sender_email, trigger_messages in senders_seen.items():
+        result = process_sender(service, client, sender_email, trigger_messages)
+        tally[result["outcome"]] = tally.get(result["outcome"], 0) + 1
+
+    log.info(
+        f"=== GMAIL DOC REVIEW: Done — "
+        f"{tally['doc_draft']} doc draft(s), {tally['email_draft']} email reply draft(s), "
+        f"{tally['flagged']} flagged for human, {tally['skipped']} skipped, {tally['error']} error(s) ==="
+    )
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    run_gmail_doc_review()

@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# OS
+.DS_Store
+
+# Secrets — defensive, even though none currently live inside this folder (checked 2026-07-09
+# ahead of the first GitHub push; real credentials for this project load from ~/Downloads/.env,
+# outside this repo). Matches the hygiene BlueLine's own repo already applies.
+.env
+*.env
+*credentials*.json
+*token*.json
+
+# Large generated media/decks — regenerate from their build_*.py scripts, not source
+pitch/audio2/
+pitch/*.html

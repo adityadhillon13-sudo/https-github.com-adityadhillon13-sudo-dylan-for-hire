@@ -1,0 +1,16 @@
+# BlueLine Staffing — Master Agent Requirements
+# Install with:
+#   pip3.11 install -r master_requirements.txt --break-system-packages
+
+anthropic
+python-dotenv
+requests
+pandas
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
+python-dateutil
+google-cloud-pubsub   # [v3.0, 2026-07-01] required for master_gmail_pubsub_listener.py (real-time email)
+pypdf                 # [v1.0, 2026-07-02] required for master_candidate_file_consolidator.py (PDF merge)
+Pillow                # [v1.0, 2026-07-02] required for master_candidate_file_consolidator.py (image -> PDF)

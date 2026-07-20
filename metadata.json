@@ -1,0 +1,8 @@
+{
+  "name": "Dylan for Hire",
+  "description": "Your Nurse Staffing Agency, Fully Automated. Dylan runs candidate intake, credential audits, and shift matching.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
