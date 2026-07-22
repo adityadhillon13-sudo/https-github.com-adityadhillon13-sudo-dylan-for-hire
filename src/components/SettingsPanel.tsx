@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { SystemSettings } from '../types';
-import { Settings, ShieldCheck, Mail, Phone, Sliders, Users, Trash, Plus, Check } from 'lucide-react';
+import { Settings, ShieldCheck, Mail, Phone, Sliders, Users, Trash, Plus, Check, Download, FileCode } from 'lucide-react';
 
 interface SettingsPanelProps {
   settings: SystemSettings;
@@ -197,6 +197,93 @@ export default function SettingsPanel({ settings, blacklist, onUpdateSettings, o
 
         <div className="p-4 bg-red-500/5 border border-red-500/20 text-[10px] text-gray-400 leading-relaxed rounded-lg mt-6">
           <strong>TCPA &amp; Rule 07:</strong> Numbers in this registry bypass all workflows. Active campaigns will immediately reject or block any candidates matching these phone numbers.
+        </div>
+      </div>
+
+      {/* BlueLine Automation Suite ZIP Export */}
+      <div className="bg-[#0B121C] border border-white/5 rounded-xl p-6">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-white/5 pb-4 mb-5">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-[#00BAC8]/10 rounded-lg">
+              <Download className="w-5 h-5 text-[#00BAC8]" />
+            </div>
+            <div>
+              <h3 className="text-sm font-bold text-white font-display">BlueLine Automation Delivery Bundle</h3>
+              <p className="text-[10px] text-gray-400 font-mono">Download the complete Python pipeline suite &amp; documentation</p>
+            </div>
+          </div>
+          <a
+            href="/api/download-blueline-zip"
+            download="blueline_automation_work.zip"
+            className="flex items-center justify-center gap-2 px-5 py-2.5 bg-[#00BAC8] hover:bg-[#00BAC8]/90 text-[#04080E] text-xs font-bold rounded-lg transition-all"
+          >
+            <Download className="w-4 h-4" />
+            Download ZIP Archive
+          </a>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="p-3.5 bg-[#04080E] border border-white/5 rounded-lg space-y-2">
+            <div className="flex items-center gap-2">
+              <FileCode className="w-4 h-4 text-[#00BAC8]" />
+              <span className="text-xs font-bold text-gray-200 font-mono">blueline_quo_helpers.py</span>
+            </div>
+            <p className="text-[10px] text-gray-400 leading-relaxed">
+              Central OpenPhone (Quo) API layer resolving the 400 Bad Request error. Built with safe rate-limit handling and automatic page-turning checks.
+            </p>
+          </div>
+
+          <div className="p-3.5 bg-[#04080E] border border-white/5 rounded-lg space-y-2">
+            <div className="flex items-center gap-2">
+              <FileCode className="w-4 h-4 text-[#00BAC8]" />
+              <span className="text-xs font-bold text-gray-200 font-mono">blueline_candidate_index_builder.py</span>
+            </div>
+            <p className="text-[10px] text-gray-400 leading-relaxed">
+              Performance crawler compiling the last 90 days of SMS history and contacts into a fast JSON database, eliminating slow API queries.
+            </p>
+          </div>
+
+          <div className="p-3.5 bg-[#04080E] border border-white/5 rounded-lg space-y-2">
+            <div className="flex items-center gap-2">
+              <FileCode className="w-4 h-4 text-[#00BAC8]" />
+              <span className="text-xs font-bold text-gray-200 font-mono">blueline_center_aliases.py</span>
+            </div>
+            <p className="text-[10px] text-gray-400 leading-relaxed">
+              A regex-based utility normalizer mapping facility name variations (typos, abbreviations) to official facility directories.
+            </p>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
+          <div className="p-3.5 bg-[#04080E] border border-white/5 rounded-lg space-y-2">
+            <div className="flex items-center gap-2">
+              <FileCode className="w-4 h-4 text-[#00BAC8]" />
+              <span className="text-xs font-bold text-gray-200 font-mono">blueline_vacancy_matcher.py</span>
+            </div>
+            <p className="text-[10px] text-gray-400 leading-relaxed">
+              Directly searches the local candidate cache for specific RN/LPN/CNA licenses and centers, drafting optimized copy-paste SMS outreach.
+            </p>
+          </div>
+
+          <div className="p-3.5 bg-[#04080E] border border-white/5 rounded-lg space-y-2">
+            <div className="flex items-center gap-2">
+              <FileCode className="w-4 h-4 text-[#00BAC8]" />
+              <span className="text-xs font-bold text-gray-200 font-mono">blueline_pipeline_depth.py</span>
+            </div>
+            <p className="text-[10px] text-gray-400 leading-relaxed">
+              Provides real-time pipeline statistics for your business development desk to instantly pitch candidate counts to prospective facilities.
+            </p>
+          </div>
+
+          <div className="p-3.5 bg-[#04080E] border border-white/5 rounded-lg space-y-2">
+            <div className="flex items-center gap-2">
+              <FileCode className="w-4 h-4 text-[#00BAC8]" />
+              <span className="text-xs font-bold text-gray-200 font-mono">README.md</span>
+            </div>
+            <p className="text-[10px] text-gray-400 leading-relaxed">
+              A complete technical guide on system architecture, .env variables, command-line arguments, and setting up the nightly automated Cron job.
+            </p>
+          </div>
         </div>
       </div>
     </div>

@@ -278,6 +278,17 @@ app.post("/api/settings", (req, res) => {
   res.json(systemSettings);
 });
 
+// Download BlueLine Automation ZIP
+app.get("/api/download-blueline-zip", (req, res) => {
+  const filePath = path.join(process.cwd(), "blueline_automation_work.zip");
+  res.download(filePath, "blueline_automation_work.zip", (err) => {
+    if (err) {
+      console.error("Failed to serve ZIP file:", err);
+      res.status(404).json({ error: "ZIP file not found. Please verify it was generated successfully." });
+    }
+  });
+});
+
 // Opt-Outs
 app.get("/api/optouts", (req, res) => {
   res.json(permanentOptOuts);
